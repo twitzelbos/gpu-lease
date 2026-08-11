@@ -1,0 +1,11 @@
+# Installed to /etc/sudoers.d/gpu-lease (mode 0440).
+#
+# The CI runner needs to pause GPU services, which requires root. Rather than
+# granting systemctl on those units directly, the grant is for this one tool:
+# it can only stop and start the units it is compiled to manage, refcounts
+# holders, and every lease it takes expires.
+#
+# SECURITY: /usr/local/bin/gpu-lease must be root-owned and not writable by
+# the runner user, or this grant becomes arbitrary root. deploy/install.sh
+# enforces that and refuses to install otherwise.
+twitzel ALL=(root) NOPASSWD: /usr/local/bin/gpu-lease

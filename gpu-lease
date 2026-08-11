@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Pause GPU-owning services so a CI job can use the GPU.
+
+    gpu-lease acquire [--ttl SECONDS] [--reason TEXT]   -> prints a lease id
+    gpu-lease release <lease-id>
+    gpu-lease status [--json]
+    gpu-lease reap                                       # run by the timer
+
+Leases are reference counted: the managed units are stopped when the first
+lease is taken and started again when the last one is dropped. Every lease
+carries an expiry, and the reaper releases stale ones, so a runner that dies
+mid-job cannot leave the GPU services down indefinitely.
+
+Stdlib only, and no dependency on the services it manages.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+# Order matters when stopping. deberta-tuner must go first: on shutdown it
+# hands the GPU back by starting sglang, so stopping sglang first would just
+# see it resurrected a moment later.
+UNITS_STOP_ORDER = os.environ.get(
+    "GPU_LEASE_UNITS", "deberta-tuner.service,sglang.service"
+).split(",")
+
+# On tmpfs on purpose: a reboot clears every lease, which is the correct state
+# after the machine comes back with its units started normally.
+STATE_DIR = Path(os.environ.get("GPU_LEASE_DIR", "/run/gpu-lease"))
+SYSTEMCTL = os.environ.get("GPU_LEASE_SYSTEMCTL", "systemctl")
+NVIDIA_SMI = os.environ.get("GPU_LEASE_NVIDIA_SMI", "nvidia-smi")
+
+DEFAULT_TTL = int(os.environ.get("GPU_LEASE_DEFAULT_TTL", "3600"))
+# A lease is a promise to give the GPU back. Cap it so a typo cannot park the
+# inference endpoint for a week.
+MAX_TTL = int(os.environ.get("GPU_LEASE_MAX_TTL", "14400"))
+# Free VRAM (MiB) that means the GPU is genuinely released.
+FREE_TARGET_MIB = int(os.environ.get("GPU_LEASE_FREE_TARGET_MIB", "20000"))
+FREE_WAIT_SECONDS = int(os.environ.get("GPU_LEASE_FREE_WAIT", "90"))
+
+
+def log(msg: str) -> None:
+    print(f"gpu-lease: {msg}", file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# state
+# --------------------------------------------------------------------------- #
+
+
+def _leases_dir() -> Path:
+    d = STATE_DIR / "leases"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+class Lock:
+    """Serialise every mutation; the refcount transitions must be atomic."""
+
+    def __enter__(self):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self._fh = (STATE_DIR / "lock").open("w")
+        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self._fh, fcntl.LOCK_UN)
+        self._fh.close()
+
+
+def _read_all() -> list[dict]:
+    out = []
+    for f in sorted(_leases_dir().glob("*.json")):
+        try:
+            out.append(json.loads(f.read_text()))
+        except (OSError, json.JSONDecodeError):
+            f.unlink(missing_ok=True)  # unreadable lease cannot hold the GPU
+    return out
+
+
+def _prune_expired(now: float) -> list[dict]:
+    """Drop expired leases. Returns the ones removed."""
+    dropped = []
+    for lease in _read_all():
+        if lease["expires_at"] <= now:
+            (_leases_dir() / f"{lease['id']}.json").unlink(missing_ok=True)
+            dropped.append(lease)
+    return dropped
+
+
+# --------------------------------------------------------------------------- #
+# units
+# --------------------------------------------------------------------------- #
+
+
+def _systemctl(action: str, unit: str) -> bool:
+    r = subprocess.run([SYSTEMCTL, action, unit], capture_output=True, text=True)
+    if r.returncode != 0:
+        log(f"{action} {unit} failed rc={r.returncode}: {r.stderr.strip()}")
+        return False
+    return True
+
+
+def _is_active(unit: str) -> bool:
+    return subprocess.run(
+        [SYSTEMCTL, "is-active", "--quiet", unit]
+    ).returncode == 0
+
+
+def _gpu_free_mib() -> int | None:
+    if not shutil.which(NVIDIA_SMI):
+        return None
+    try:
+        r = subprocess.run(
+            [NVIDIA_SMI, "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=30,
+        )
+        return int(r.stdout.strip().splitlines()[0])
+    except Exception:
+        return None
+
+
+def _stop_units() -> None:
+    """Stop the managed units and wait for the driver to reclaim VRAM."""
+    for unit in UNITS_STOP_ORDER:
+        if _is_active(unit):
+            log(f"stopping {unit}")
+            _systemctl("stop", unit)
+        else:
+            log(f"{unit} already inactive")
+
+    # deberta-tuner starts sglang from its shutdown path, so sglang can come
+    # back to life between the two stops above. Sweep once more.
+    for unit in UNITS_STOP_ORDER[1:]:
+        if _is_active(unit):
+            log(f"{unit} restarted itself during shutdown; stopping again")
+            _systemctl("stop", unit)
+
+    deadline = time.monotonic() + FREE_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        free = _gpu_free_mib()
+        if free is None or free >= FREE_TARGET_MIB:
+            if free is not None:
+                log(f"GPU free: {free} MiB")
+            return
+        time.sleep(2)
+    log(f"warning: GPU still shows {_gpu_free_mib()} MiB free after "
+        f"{FREE_WAIT_SECONDS}s; continuing anyway")
+
+
+def _start_units() -> None:
+    """Start the managed units again, in reverse of the stop order.
+
+    sglang comes back first. If the tuner has queued work it will stop sglang
+    again within a couple of seconds -- one wasted start, which is preferable
+    to leaving the endpoint down when the tuner has nothing to do (it only
+    restarts a co-tenant it stopped itself).
+    """
+    for unit in reversed(UNITS_STOP_ORDER):
+        log(f"starting {unit}")
+        # Clear any tripped start-rate limiter first, or systemd refuses.
+        subprocess.run([SYSTEMCTL, "reset-failed", unit], capture_output=True)
+        _systemctl("start", unit)
+
+
+# --------------------------------------------------------------------------- #
+# commands
+# --------------------------------------------------------------------------- #
+
+
+def cmd_acquire(args) -> int:
+    ttl = max(1, min(args.ttl, MAX_TTL))
+    if ttl != args.ttl:
+        log(f"ttl clamped to {ttl}s (max {MAX_TTL})")
+
+    now = time.time()
+    lease = {
+        "id": uuid.uuid4().hex[:12],
+        "reason": args.reason or "",
+        "owner": os.environ.get("SUDO_USER") or os.environ.get("USER") or "unknown",
+        "pid": os.getppid(),
+        "acquired_at": now,
+        "expires_at": now + ttl,
+        "ttl": ttl,
+    }
+
+    with Lock():
+        _prune_expired(now)
+        first = len(_read_all()) == 0
+        (_leases_dir() / f"{lease['id']}.json").write_text(json.dumps(lease))
+        if first:
+            log("first lease; pausing GPU services")
+            _stop_units()
+        else:
+            log(f"joining {len(_read_all()) - 1} existing lease(s); already paused")
+
+    print(lease["id"])
+    return 0
+
+
+def cmd_release(args) -> int:
+    with Lock():
+        path = _leases_dir() / f"{args.lease_id}.json"
+        existed = path.exists()
+        if not existed:
+            log(f"no such lease: {args.lease_id} (already released or expired)")
+        path.unlink(missing_ok=True)
+        _prune_expired(time.time())
+        remaining = _read_all()
+        if remaining:
+            log(f"{len(remaining)} lease(s) still held; services stay paused")
+            return 0
+        if not existed:
+            # Nothing was released, so nothing is ours to resume. Starting the
+            # units here would resurrect services an operator had deliberately
+            # stopped, and would fire on a duplicate cleanup step.
+            log("nothing was held; leaving the units alone")
+            return 0
+        log("last lease released; resuming GPU services")
+        _start_units()
+    return 0
+
+
+def cmd_reap(args) -> int:
+    with Lock():
+        now = time.time()
+        before = _read_all()
+        dropped = _prune_expired(now)
+        for d in dropped:
+            held = int(now - d["acquired_at"])
+            log(f"lease {d['id']} (owner={d['owner']}, reason={d['reason']!r}) "
+                f"expired after {held}s; releasing")
+        if dropped and before and not _read_all():
+            log("all leases expired; resuming GPU services")
+            _start_units()
+    return 0
+
+
+def cmd_status(args) -> int:
+    with Lock():
+        now = time.time()
+        leases = [x for x in _read_all() if x["expires_at"] > now]
+    state = {
+        "held": bool(leases),
+        "count": len(leases),
+        "gpu_free_mib": _gpu_free_mib(),
+        "units": {u: ("active" if _is_active(u) else "inactive") for u in UNITS_STOP_ORDER},
+        "leases": [
+            {
+                "id": x["id"],
+                "owner": x["owner"],
+                "reason": x["reason"],
+                "held_for_seconds": int(now - x["acquired_at"]),
+                "expires_in_seconds": int(x["expires_at"] - now),
+            }
+            for x in leases
+        ],
+    }
+    if args.json:
+        print(json.dumps(state, indent=2))
+        return 0
+
+    print(f"held      : {state['held']} ({state['count']} lease(s))")
+    print(f"gpu free  : {state['gpu_free_mib']} MiB")
+    for unit, s in state["units"].items():
+        print(f"  {unit:<28} {s}")
+    for x in state["leases"]:
+        print(f"  lease {x['id']} owner={x['owner']} held={x['held_for_seconds']}s "
+              f"expires_in={x['expires_in_seconds']}s reason={x['reason']!r}")
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="gpu-lease", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    a = sub.add_parser("acquire", help="pause GPU services and take a lease")
+    a.add_argument("--ttl", type=int, default=DEFAULT_TTL,
+                   help=f"seconds before auto-release (default {DEFAULT_TTL}, max {MAX_TTL})")
+    a.add_argument("--reason", default="", help="free text, shown in status")
+    a.set_defaults(fn=cmd_acquire)
+
+    r = sub.add_parser("release", help="drop a lease; resumes services if it was the last")
+    r.add_argument("lease_id")
+    r.set_defaults(fn=cmd_release)
+
+    s = sub.add_parser("status", help="show leases and unit state")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("reap", help="release expired leases (run by the timer)")
+    p.set_defaults(fn=cmd_reap)
+
+    args = ap.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
