@@ -1,0 +1,9 @@
+[Unit]
+Description=Release expired GPU leases
+Documentation=file:/usr/local/share/gpu-lease/README.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gpu-lease reap
+# Deliberately no dependency on the managed units: this must be able to start
+# them, which an ordering dependency would fight.

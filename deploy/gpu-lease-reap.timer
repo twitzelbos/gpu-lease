@@ -1,0 +1,13 @@
+[Unit]
+Description=Check for expired GPU leases every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+# A lease outliving its TTL by up to a minute is fine; what matters is that a
+# dead runner cannot hold the GPU indefinitely.
+AccuracySec=15s
+Unit=gpu-lease-reap.service
+
+[Install]
+WantedBy=timers.target
